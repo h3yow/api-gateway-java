@@ -11,19 +11,31 @@ public class GatewayException extends RuntimeException {
     private final RejectReason reason;
     private final String caller;
     private final ApiVersion version;
+    private final String group;
     private final long retryAfterMillis;
 
     public GatewayException(RejectReason reason, String caller, ApiVersion version,
                             long retryAfterMillis, String message) {
-        this(reason, caller, version, retryAfterMillis, message, null);
+        this(reason, caller, version, null, retryAfterMillis, message, null);
+    }
+
+    public GatewayException(RejectReason reason, String caller, ApiVersion version, String group,
+                            long retryAfterMillis, String message) {
+        this(reason, caller, version, group, retryAfterMillis, message, null);
     }
 
     public GatewayException(RejectReason reason, String caller, ApiVersion version,
+                            long retryAfterMillis, String message, Throwable cause) {
+        this(reason, caller, version, null, retryAfterMillis, message, cause);
+    }
+
+    public GatewayException(RejectReason reason, String caller, ApiVersion version, String group,
                             long retryAfterMillis, String message, Throwable cause) {
         super(message, cause);
         this.reason = reason;
         this.caller = caller;
         this.version = version;
+        this.group = group;
         this.retryAfterMillis = retryAfterMillis;
     }
 
@@ -37,6 +49,10 @@ public class GatewayException extends RuntimeException {
 
     public ApiVersion version() {
         return version;
+    }
+
+    public String group() {
+        return group;
     }
 
     public long retryAfterMillis() {

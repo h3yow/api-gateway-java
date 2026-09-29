@@ -30,7 +30,7 @@ import java.util.concurrent.atomic.AtomicReference;
  *     <li>其他非 2xx → DOWNSTREAM_ERROR。</li>
  * </ul>
  */
-public class DownstreamClient {
+public class DownstreamClient implements DownstreamInvoker {
 
     private final String configuredBaseUrl;
     private final long timeoutMillis;
@@ -79,6 +79,7 @@ public class DownstreamClient {
         return restClient.get();
     }
 
+    @Override
     public GatewayResponse invoke(GatewayRequest request, ApiVersion routedVersion) {
         try {
             var response = client()
