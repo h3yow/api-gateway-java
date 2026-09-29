@@ -42,7 +42,8 @@ public class DownstreamClient {
         this.configuredBaseUrl = configuredBaseUrl;
         this.timeoutMillis = timeoutMillis;
         this.resolvedBaseUrl = configuredBaseUrl;
-        // 基址不含动态端口占位时，直接构建（供纯单测对真实外部 HTTP 服务器使用）
+        // 基址含动态端口占位（:${server.port} 或 :0）时惰性构建，待端口就绪事件解析真实端口；
+        // 其余基址（纯单测对真实外部 HTTP 服务器）立即构建
         if (!configuredBaseUrl.contains("${server.port}") && !configuredBaseUrl.endsWith(":0")) {
             SimpleClientHttpRequestFactory factory = new SimpleClientHttpRequestFactory();
             factory.setConnectTimeout((int) Math.min(timeoutMillis, Integer.MAX_VALUE));

@@ -1,7 +1,8 @@
 # API Gateway（本地 HTTP 网关层）
 
-在本地运行的 HTTP 服务前置一层网关，用**本地状态**维护调用方配额与版本策略，
-为所有入口（`/gateway/**`）提供一致、可解释的：并发限流、版本协商、下游异常统一处理。
+在本地运行的 HTTP 服务前置一层网关，用**本地状态**维护调用方配额、版本策略与**接口组策略**，
+为所有入口（`/gateway/**`）提供一致、可解释的：路由判定、并发限流、版本协商、
+接口组上线状态管理、下游异常统一处理与**错误来源分类**。
 
 ## 1. 请求约定
 
@@ -13,159 +14,228 @@
 - 网关入口：`POST /gateway/**`，路径去掉 `/gateway` 前缀后转发下游，
   例如 `POST /gateway/mock/downstream/echo` → 下游 `/mock/downstream/echo`。
 - 每个请求生成唯一 `X-Trace-Id` 响应头（重试也是新请求、新 ID、重新判定）。
+  整个响应**只有这一个追踪标识**，且与错误体 `traceId` 字段严格一致。
 
-## 2. 限流维度与窗口语义
+## 2. 处理链路
 
-- **维度**：`调用方 × 接口版本`。同一调用方不同版本配额互相独立
-  （caller-a 的 v1.0 与 v1.1 各有独立计数器）。
-- **算法**：固定窗口（fixed window）。窗口按 epoch 毫秒对齐：
-  `windowStart = floor(now / windowMillis) × windowMillis`，
-  窗口切换瞬间旧计数作废、新窗口从 0 开始（边界确定、无平滑泄漏）。
-- **并发正确性**：每维度一个原子窗口状态，`tryAcquire` 以 CAS 自旋完成
-  “检查窗口 → 必要时翻窗 → 扣减 1”。放行与扣减在同一次原子迁移内完成：
-  - 不会重复放行（200 个并发请求抢 50 配额，恰好 50 个成功，放行序号严格 1..50）；
-  - 不会误拒（窗口未满时每个请求都能抢到配额）；
-  - 拒绝路径**不修改计数**，不产生扣减。
-- **配额扣减时机**：仅在版本协商通过后、调用下游之前扣减一次。
-  下游超时/429/500 **不退还**配额（调用机会已消费）；编排层对 `tryAcquire` 只调用一次，
-  同一请求不可能重复计数。调用方重试是一次新的 HTTP 请求，按新请求重新判定。
-- **默认策略（未登记调用方不明令无限放行）**，查找按以下顺序命中即止：
-  1. `caller|version` 精确配额；
-  2. `caller|*` 调用方版本无关配额；
-  3. `__default__|version` 版本级默认配额；
-  4. `__default__|*` 兜底默认配额（始终存在，缺失即启动失败）。
+```
+HTTP 请求
+  └─ TraceIdFilter（生成唯一 traceId，写响应头，仅一次）
+      └─ GatewayController（解析 X-Caller-Id / X-Api-Version，非法即拒）
+          └─ GatewayOrchestrator
+              1. VersionNegotiator 调用方级版本协商（失败：不进入后续，不扣配额）
+              2. RouteRegistry 路由解析（未注册→本地 404；方法不允许→本地 405；不转发下游）
+              3. GroupAuthorizer 接口组准入（未开放/暂停/灰度/组版本，失败：不扣配额）
+              4. RateLimiter 按 调用方×版本×接口组 扣减（全请求仅此一次；失败不扣）
+              5. DownstreamClient 真实 HTTP 调用（透传 traceId/版本，超时 300ms）
+                 下游异常 → DOWNSTREAM_TIMEOUT / _RATE_LIMITED / _ERROR（配额不退还）
+          └─ GatewayExceptionHandler → 统一 ErrorResponse（含 errorSource）+ Retry-After
+```
 
-默认本地配额（`RateLimitConfig.defaultLocalConfig`，窗口均为 1000ms）：
+## 3. 接口组：路由、配额与回退
 
-| 调用方 | v1.0 | v1.1 |
-| --- --- --- |
-| caller-a | 5/s | 10/s |
-| caller-b | 3/s（`caller-b|*`） | 3/s |
-| 未登记调用方 | **1/s（默认策略）** | **1/s** |
+### 3.1 路由归属
 
-被限流时返回 `429`、错误码 `GATEWAY_RATE_LIMITED`，
-响应体含 `retryAfterMillis`（距当前窗口结束的毫秒数），响应头含 `Retry-After`（向上取整秒）。
+每个下游路径在 `ApiGroupConfig` 中**精确注册**为一条路由，并归属于一个接口组：
 
-## 3. 版本协商与兼容规则
+```
+Route(downstreamPath, groupId, allowedMethods)
+```
 
-- 系统受支持版本集合在启动时固定：默认 `{v1.0, v1.1}`（`VersionNegotiator`）。
-- 每个调用方有一份**白名单**策略；调用方未登记时落到 `__default__` 默认策略（默认仅允许 v1.0）。
-- 判定为纯函数，相同输入结论稳定（测试连续断言 100 次一致）：
+- 路径未注册 → 本地 `404 GATEWAY_ROUTE_NOT_FOUND`（**不会**转发下游碰运气，因此绝不伪装成下游故障）；
+- 路径存在但 HTTP 方法不在 `allowedMethods` → 本地 `405 GATEWAY_METHOD_NOT_ALLOWED`；
+- 路由引用未声明的组 / 组开放了系统不支持的版本 / 缺少默认组 → **启动即失败（fail-fast）**。
 
-| 情形 | 结论 |
-| --- | --- |
-| 未声明版本 | 拒绝 `GATEWAY_MISSING_VERSION`，不回落 |
-| 版本字符串无法解析 | 拒绝 `GATEWAY_UNKNOWN_VERSION`，不回落 |
-| 版本不在系统支持集合（如 v9.9、v2.0） | 拒绝 `GATEWAY_UNKNOWN_VERSION`，不回落 |
-| 版本受支持但不在该调用方白名单（caller-b 请求 v1.1） | 拒绝 `GATEWAY_CALLER_VERSION_NOT_ALLOWED`，不回落 |
-| 命中白名单 | 放行，`resolved == 声明版本`（不做小版本静默替换） |
+### 3.2 计数维度与配额隔离
 
-## 4. 错误分类（统一结构、原因可区分）
+限流计数维度为 **`调用方 × 接口版本 × 接口组`**：同一调用方同一版本访问不同接口组时，
+**各自独立计数、互不占用额度**。同一调用方在不同接口组、不同版本下的配额与判定结论彼此独立、稳定。
 
-所有错误均为同一 JSON 结构，并带 `X-Trace-Id`：
+固定窗口算法、CAS 自旋、并发守恒、拒绝不扣减等语义与上一版完全一致（见 §4），
+只是计数键从 `caller|version` 扩展为 `caller|version|groupId`。
+
+### 3.3 组配额的回退顺序（未配置组绝不无限放行）
+
+每个接口组可配置自己的 `QuotaPolicy(limit, windowMillis)`（独立限额与窗口）。
+某条“调用方×版本×组”请求的最终配额按以下顺序命中即止：
+
+1. 组内精确配额 `caller|version|groupId`（可选的组内调用方覆盖）；
+2. 组内调用方默认 `caller|*|groupId`；
+3. **组级配额**：接口组自身配置的限额与窗口；
+4. **回退到既有“调用方 × 版本”配额策略**：`caller|version` → `caller|*`
+   → `__default__|version` → `__default__|*`（兜底始终存在）。
+
+> 因此“接口组没单独配配额”等价于**回退到有限的调用方×版本配额**，而不是放开。
+> 超限时同样返回 `retryAfterMillis`（距该组当前窗口结束的毫秒数）与可解释的 `basis`，
+> 说明命中的是组配额还是哪一级回退。
+
+### 3.4 默认本地配置
+
+| 接口组 | 状态 | 开放版本 | 组配额 | 演示路由（前缀 `/gateway`） |
+| --- | --- | --- | --- | --- |
+| `__default_group__` | OPEN | v1.0,v1.1 | 无（回退调用方×版本） | `/mock/downstream/{echo,slow,error,busy}` |
+| `orders` | OPEN | **仅 v1.0** | **2/1s** | `/mock/downstream/orders/create` |
+| `payments` | OPEN | v1.0,v1.1 | 4/1s | `/mock/downstream/payments/charge` |
+| `reports` | **PAUSED** | v1.0,v1.1 | 无（回退） | `/mock/downstream/reports/daily` |
+| `beta-ai` | **CANARY** | **仅 v1.1**，灰度白名单 `caller-a` | 无（回退） | `/mock/downstream/ai/chat` |
+| `ledger-v2` | **NOT_OPENED** | 仅声明 v1.1 | 无（回退） | `/mock/downstream/ledger/v2` |
+
+调用方×版本既有默认配额（窗口均为 1000ms）：caller-a v1.0=5/s、v1.1=10/s；
+caller-b `*`=3/s；未登记调用方=1/s。
+
+## 4. 固定窗口与并发正确性
+
+- **窗口对齐**：`windowStart = floor(now / windowMillis) × windowMillis`，
+  窗口切换瞬间旧计数作废、新窗口从 0 开始。组可有自己的 `windowMillis`，不同组窗口互不影响。
+- **原子扣减**：每维度一个原子窗口状态，`tryAcquire` 以 CAS 自旋完成
+  “检查窗口 → 必要时翻窗 → 扣减 1”，放行与扣减在同一次原子迁移内：
+  - 不会重复放行（N 个并发请求抢 K 配额，恰好 K 个成功，放行序号严格 1..K）；
+  - 不会误拒；拒绝路径不修改计数。
+- **只扣一次**：仅在版本协商、路由、组准入全部通过后、调用下游之前扣减一次；
+  编排层对 `tryAcquire` 只调用一次，无重试逻辑。下游超时/429/500 **不退还**配额。
+- 限流返回 `429 GATEWAY_RATE_LIMITED`，含 `retryAfterMillis` 与 `Retry-After`（向上取整秒）。
+
+## 5. 版本协商与接口组开放语义
+
+版本判定分两层，**都显式判定、绝不静默替换声明版本、绝不自动套用默认接口策略**：
+
+1. **调用方级（系统支持集合 + 调用方白名单，既有能力）**：未声明/无法解析/系统不支持/
+   调用方白名单不包含 → 对应错误码拒绝，`resolved == 声明版本` 或拒绝。
+2. **接口组级（本组 `openVersions` + 上线状态）**：
+
+| 情形 | 结论 | HTTP |
+| --- | --- | --- |
+| 接口组 `NOT_OPENED`（尚未开放） | `GATEWAY_API_GROUP_NOT_OPENED` | 404 |
+| 接口组 `PAUSED`（已上线后暂停） | `GATEWAY_API_GROUP_PAUSED`（建议稍后重试） | 503 |
+| 接口组 `CANARY` 且调用方不在灰度白名单 | `GATEWAY_API_GROUP_CANARY_NOT_ALLOWED` | 403 |
+| 声明版本不在本组 `openVersions` | `GATEWAY_API_GROUP_VERSION_NOT_ALLOWED`，不替换/不回落 | 400 |
+| 状态与版本都通过 | 放行，生效版本即声明版本 | — |
+
+- `PAUSED` 与 `NOT_OPENED` 是不同语义，错误码与 HTTP 状态都可区分。
+- 接口组的开放版本**只看本组策略**：即便某调用方在调用方级能用某版本，
+  只要该接口组未开放该版本，就在组级被拒（例如 caller-a 的 v1.1 访问仅开 v1.0 的 `orders`）。
+- 未登记调用方仍走调用方级默认白名单（默认仅 v1.0），不会因为某个组开了 v1.1 就越权。
+- 上述任一拒绝都发生在扣减配额之前，**不消耗任何接口组配额**。
+
+## 6. 错误来源分类（LOCAL / DOWNSTREAM）
+
+统一错误结构新增 `errorSource` 与 `group` 字段：
 
 ```json
 {
   "traceId": "...",
+  "errorSource": "LOCAL",
   "errorCode": "GATEWAY_RATE_LIMITED",
   "reason": "RATE_LIMITED_QUOTA_EXHAUSTED",
-  "caller": "caller-b",
+  "caller": "grp-iso",
   "version": "v1.0",
+  "group": "orders",
   "message": "判定依据……",
   "retryAfterMillis": 742
 }
 ```
 
-| errorCode | HTTP | 含义 | retryAfterMillis |
+| errorCode | HTTP | source | 含义 |
 | --- | --- | --- | --- |
-| GATEWAY_MISSING_CALLER | 401 | 未提供调用方标识 | 0 |
-| GATEWAY_MISSING_VERSION | 400 | 未声明版本 | 0 |
-| GATEWAY_UNKNOWN_VERSION | 400 | 版本无法解析/系统不支持 | 0 |
-| GATEWAY_CALLER_VERSION_NOT_ALLOWED | 400 | 版本与调用方接口不兼容 | 0 |
-| GATEWAY_RATE_LIMITED | 429 | 网关本地配额耗尽 | >0（窗口剩余毫秒） |
-| GATEWAY_DOWNSTREAM_TIMEOUT | 504 | 下游读/连接超时或 IO 故障 | 0 |
-| GATEWAY_DOWNSTREAM_RATE_LIMITED | 429 | 下游返回 429 | 0 |
-| GATEWAY_DOWNSTREAM_ERROR | 502 | 下游其他非 2xx / 网关兜底错误 | 0 |
+| GATEWAY_MISSING_CALLER | 401 | LOCAL | 未提供调用方标识 |
+| GATEWAY_MISSING_VERSION | 400 | LOCAL | 未声明版本 |
+| GATEWAY_UNKNOWN_VERSION | 400 | LOCAL | 版本无法解析/系统不支持 |
+| GATEWAY_CALLER_VERSION_NOT_ALLOWED | 400 | LOCAL | 版本与调用方不兼容 |
+| GATEWAY_ROUTE_NOT_FOUND | 404 | LOCAL | 网关本地无此下游路由 |
+| GATEWAY_METHOD_NOT_ALLOWED | 405 | LOCAL | 路由存在但请求方法不支持 |
+| GATEWAY_API_GROUP_NOT_OPENED | 404 | LOCAL | 接口组尚未开放 |
+| GATEWAY_API_GROUP_PAUSED | 503 | LOCAL | 接口组暂停 |
+| GATEWAY_API_GROUP_CANARY_NOT_ALLOWED | 403 | LOCAL | 不在灰度白名单 |
+| GATEWAY_API_GROUP_VERSION_NOT_ALLOWED | 400 | LOCAL | 版本不在该接口组开放范围 |
+| GATEWAY_RATE_LIMITED | 429 | LOCAL | 网关本地配额耗尽（带重试建议、Retry-After） |
+| GATEWAY_INTERNAL_ERROR | 500 | LOCAL | 网关自身未预期缺陷（**不**伪装成下游故障） |
+| GATEWAY_DOWNSTREAM_TIMEOUT | 504 | DOWNSTREAM | 下游读/连接超时或 IO 故障 |
+| GATEWAY_DOWNSTREAM_RATE_LIMITED | 429 | DOWNSTREAM | 下游返回 429（**无** Retry-After，不替下游给窗口） |
+| GATEWAY_DOWNSTREAM_ERROR | 502 | DOWNSTREAM | 下游其他非 2xx |
 
-注意两种 429 的 `errorCode` 不同：`GATEWAY_RATE_LIMITED`（本地限流，带重试建议）
-与 `GATEWAY_DOWNSTREAM_RATE_LIMITED`（下游限流）。
+关键区分：两种 429 的 `errorCode`/`errorSource` 不同——本地限流是
+`LOCAL/GATEWAY_RATE_LIMITED`（带 `retryAfterMillis` 与 `Retry-After`），
+下游限流是 `DOWNSTREAM/GATEWAY_DOWNSTREAM_RATE_LIMITED`。
+路由不存在、方法不支持、网关内部错误一律 `LOCAL`。
 
-## 5. 处理链路
+## 7. 本地验证
 
-```
-HTTP 请求
-  └─ TraceIdFilter（生成 traceId，写响应头）
-      └─ GatewayController（解析 X-Caller-Id / X-Api-Version，非法即拒）
-          └─ GatewayOrchestrator
-              1. VersionNegotiator 协商（失败：不扣配额）
-              2. RateLimiter.tryAcquire（全请求仅此一次；失败：不扣配额）
-              3. DownstreamClient 真实 HTTP 调用（透传 traceId/版本，超时 300ms）
-              4. 下游异常 → DOWNSTREAM_TIMEOUT / _RATE_LIMITED / _ERROR
-          └─ GatewayExceptionHandler → 统一 ErrorResponse + Retry-After
-```
-
-## 6. 本地验证
-
-### 6.1 启动
+### 7.1 启动
 
 ```bash
 mvn spring-boot:run
-# 服务监听 8080；下游基址默认 http://localhost:8080（同进程 mock）
+# 服务监听 8080；下游基址默认 http://localhost:${server.port}（同进程 mock）
 ```
 
-### 6.2 curl 手动验证
+### 7.2 curl 手动验证
 
 ```bash
-# 正常转发
+# 正常转发（default 组，回退调用方×版本配额）
 curl -i -X POST http://localhost:8080/gateway/mock/downstream/echo \
   -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.0' -d '{}'
 
-# 连续打 caller-a/v1.0 配额（5/s），第 6 次得到 429 + Retry-After + retryAfterMillis
-for i in $(seq 1 6); do
+# orders 组独立配额 2/s：第 3 次本地 429（不影响你在其他组的额度）
+for i in 1 2 3; do
   curl -s -o /dev/null -w '%{http_code}\n' -X POST \
-    http://localhost:8080/gateway/mock/downstream/echo \
-    -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.0' -d '{}'
+    http://localhost:8080/gateway/mock/downstream/orders/create \
+    -H 'X-Caller-Id: demo' -H 'X-Api-Version: v1.0' -d '{}'
 done
 
-# 版本不兼容（caller-b 不允许 v1.1）
-curl -i -X POST http://localhost:8080/gateway/mock/downstream/echo \
-  -H 'X-Caller-Id: caller-b' -H 'X-Api-Version: v1.1' -d '{}'
-
-# 下游超时（mock sleep 2s，网关 300ms 超时）→ 504 GATEWAY_DOWNSTREAM_TIMEOUT
-curl -i -X POST http://localhost:8080/gateway/mock/downstream/slow \
+# orders 仅开放 v1.0：caller-a 的 v1.1 在组级被拒（不静默替换）
+curl -i -X POST http://localhost:8080/gateway/mock/downstream/orders/create \
   -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.1' -d '{}'
 
-# 下游 429 / 500
+# 暂停 / 未开放 / 灰度
+curl -i -X POST http://localhost:8080/gateway/mock/downstream/reports/daily \
+  -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.0' -d '{}'      # 503 PAUSED LOCAL
+curl -i -X POST http://localhost:8080/gateway/mock/downstream/ledger/v2 \
+  -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.1' -d '{}'      # 404 NOT_OPENED LOCAL
+curl -i -X POST http://localhost:8080/gateway/mock/downstream/ai/chat \
+  -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.1' -d '{}'      # 200（灰度白名单内）
+
+# 本地路由 404 / 方法 405（都是 LOCAL，不转发下游）
+curl -i -X POST http://localhost:8080/gateway/mock/does/not/exist \
+  -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.0' -d '{}'
+curl -i -X GET http://localhost:8080/gateway/mock/downstream/orders/create \
+  -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.0'
+
+# 下游 429（errorSource=DOWNSTREAM，无 Retry-After）
 curl -i -X POST http://localhost:8080/gateway/mock/downstream/busy \
   -H 'X-Caller-Id: caller-a' -H 'X-Api-Version: v1.1' -d '{}'
-
-# 未登记调用方：默认 1/s，第二次即被限流
-curl -i -X POST http://localhost:8080/gateway/mock/downstream/echo \
-  -H 'X-Caller-Id: nobody' -H 'X-Api-Version: v1.0' -d '{}'
 ```
 
-### 6.3 自动化测试
+### 7.3 自动化测试（任意时间稳定复现）
 
 ```bash
 mvn test
 ```
 
-共 22 个用例，覆盖需求点：
+共 **40** 个用例。涉及窗口边界与并发的测试**全部注入可控时钟（`MutableClock`）**，
+由测试主动把时间推进到窗口边界（如 `999 → 1000`），**不依赖真实等待**，因此任意时间运行结论一致：
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
-| `RateLimiterTest` | 20 线程 × 10 请求并发抢 50 配额（守恒：恰好 50 放行/150 拒绝，放行序号 1..50）、拒绝不扣减、固定窗口边界切换、跨调用方/版本维度独立、未登记调用方默认策略 |
-| `VersionNegotiatorTest` | 白名单放行稳定、缺版本/不支持版本/调用方不兼容均明确拒绝、默认策略、版本字符串解析 |
-| `DownstreamClientTest` | 真实本地 HTTP 服务器（MockWebServer）模拟 200/429/500/读超时，断言三类原因可区分、traceId 透传 |
-| `GatewayIntegrationTest` | 端到端：并发限流守恒与错误结构、窗口翻页恢复、版本拒绝不扣配额、缺调用方、下游三类错误统一结构、重试为新请求（新 traceId） |
+| `GroupRateLimiterTest` | 同调用方同版本跨接口组配额隔离、组配额优先与回退（未配置组不放任）、组窗口切换精确、16 线程抢 2 配额守恒（放行序号 1..2） |
+| `GroupPolicyTest` | PAUSED/NOT_OPENED/CANARY/组版本拒绝原因可区分、组间版本规则独立、不静默替换、404/405 均 LOCAL、非法配置 fail-fast |
+| `GatewayOrchestratorTest` | 假下游 + 可控时钟：本地各类拒绝不扣减/不调下游、放行只扣一次、下游失败不退还且 source=DOWNSTREAM、本地限流先于下游 |
+| `GatewayIntegrationTest` | 端到端：组配额隔离、暂停/未开放/组版本/灰度拒绝、404/405 本地分类、本地与下游 429 区分、唯一 traceId 头/体一致、既有限流/窗口/下游行为 |
+| `RateLimiterTest` / `VersionNegotiatorTest` / `DownstreamClientTest` | 既有能力回归（调用方×版本限流守恒、调用方版本协商、下游三类错误） |
 
-单测 stdout 打印调用方、版本、配额与判定依据，例如：
+单测 stdout 打印调用方、版本、接口组、配额与判定依据，例如：
 
 ```
-[RateLimitTest] caller=stranger version=v1.0 acquired=false quota=1/1 remaining=0
-  window=[0,1000) retryAfterMillis=1000 reason=RATE_LIMITED_QUOTA_EXHAUSTED
-  basis=fallback default quota for __default__|*; ...
+[GroupRateLimitTest] 组间隔离 orders=2 payments=4 default=5 互不占用
+[OrchestratorTest] 本地拒绝均未扣减配额、未调用下游
 ```
 
-服务端处理日志（INFO，`com.github.h3yow.apigatewayjava.gateway`）同样打印
-`traceId/caller/version/quota/decision/reason/basis`。
+## 8. 兼容范围
+
+- 计数维度由 `调用方|版本` 扩展为 `调用方|版本|接口组`；`RateLimiter` 保留旧构造与
+  `tryAcquire(caller, version)`，旧的调用方×版本单测与行为不回归。
+- 既有错误码与 HTTP 状态保持不变；`ErrorResponse` 新增 `errorSource`、`group` 两个字段（增量、向后兼容）。
+- 新增错误码：`GATEWAY_ROUTE_NOT_FOUND`、`GATEWAY_METHOD_NOT_ALLOWED`、
+  `GATEWAY_API_GROUP_PAUSED`、`GATEWAY_API_GROUP_NOT_OPENED`、
+  `GATEWAY_API_GROUP_CANARY_NOT_ALLOWED`、`GATEWAY_API_GROUP_VERSION_NOT_ALLOWED`、
+  `GATEWAY_INTERNAL_ERROR`。
+- 未预期异常由旧的 `502 GATEWAY_DOWNSTREAM_ERROR` 修正为 `500 GATEWAY_INTERNAL_ERROR`（LOCAL），
+  避免把网关自身缺陷误报为下游故障。

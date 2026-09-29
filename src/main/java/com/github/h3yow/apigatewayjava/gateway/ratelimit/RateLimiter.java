@@ -1,6 +1,8 @@
 package com.github.h3yow.apigatewayjava.gateway.ratelimit;
 
+import com.github.h3yow.apigatewayjava.gateway.group.QuotaResolver;
 import com.github.h3yow.apigatewayjava.gateway.model.ApiVersion;
+import com.github.h3yow.apigatewayjava.gateway.model.QuotaPolicy;
 import com.github.h3yow.apigatewayjava.gateway.model.RateLimitDecision;
 import com.github.h3yow.apigatewayjava.gateway.model.RejectReason;
 
@@ -13,7 +15,10 @@ import java.util.concurrent.atomic.AtomicReference;
  *
  * 语义：
  * <ul>
- *     <li>计数维度为 {@code 调用方|版本}，不同维度互不影响；</li>
+ *     <li>计数维度为 {@code 调用方|版本|接口组}，不同维度互不影响；
+ *         同一调用方同一版本访问不同接口组时各自独立计数，互不占用额度；</li>
+ *     <li>每条维度的 {@link QuotaPolicy} 由 {@link QuotaResolver} 解析：接口组可声明
+ *         自己的限额与窗口，未声明则回退到“调用方 × 版本”既有策略，始终有限；</li>
  *     <li>窗口边界按 epoch 对齐：windowStart = floor(now / windowMillis) * windowMillis，
  *         窗口切换瞬间旧计数作废、新窗口从 0 开始，边界确定可测；</li>
  *     <li>{@code tryAcquire} 通过 CAS 自旋完成“检查窗口→必要时翻窗→扣减”，
@@ -25,18 +30,41 @@ import java.util.concurrent.atomic.AtomicReference;
 public class RateLimiter {
 
     private final RateLimitConfig config;
+    private final QuotaResolver quotaResolver;
     private final Clock clock;
     private final ConcurrentHashMap<String, AtomicReference<Window>> windows = new ConcurrentHashMap<>();
 
+    /** 旧构造：仅按“调用方 × 版本”配额。 */
     public RateLimiter(RateLimitConfig config, Clock clock) {
         this.config = config;
+        this.quotaResolver = null;
         this.clock = clock;
     }
 
+    /** 新构造：配额按“调用方 × 版本 × 接口组”解析。 */
+    public RateLimiter(QuotaResolver quotaResolver, Clock clock) {
+        this.config = null;
+        this.quotaResolver = quotaResolver;
+        this.clock = clock;
+    }
+
+    /** 旧维度（无接口组）。 */
     public RateLimitDecision tryAcquire(String caller, ApiVersion version) {
-        var policy = config.policyFor(caller, version);
-        long now = clock.millis();
+        QuotaPolicy policy = config.policyFor(caller, version);
         String key = RateLimitConfig.key(caller, version.httpValue());
+        return acquire(key, policy, config.basisOf(caller, version), null, caller, version);
+    }
+
+    /** 接口组维度：同一调用方×版本在不同组之间独立计数。 */
+    public RateLimitDecision tryAcquire(String caller, ApiVersion version, String groupId) {
+        QuotaResolver.Resolved resolved = quotaResolver.resolve(caller, version, groupId);
+        String key = key(caller, version.httpValue(), groupId);
+        return acquire(key, resolved.policy(), resolved.basis(), groupId, caller, version);
+    }
+
+    private RateLimitDecision acquire(String key, QuotaPolicy policy, String basis, String groupId,
+                                      String caller, ApiVersion version) {
+        long now = clock.millis();
         AtomicReference<Window> ref = windows.computeIfAbsent(key, k -> new AtomicReference<>());
 
         while (true) {
@@ -54,7 +82,8 @@ public class RateLimiter {
                         active.start(),
                         active.end(),
                         retryAfter,
-                        config.basisOf(caller, version)
+                        groupId,
+                        basis
                                 + "; window [" + active.start() + "," + active.end() + ")"
                                 + " used=" + active.used() + "/" + active.limit()
                                 + "; retryAfterMillis=" + retryAfter);
@@ -72,7 +101,8 @@ public class RateLimiter {
                         next.start(),
                         next.end(),
                         0L,
-                        config.basisOf(caller, version)
+                        groupId,
+                        basis
                                 + "; window [" + next.start() + "," + next.end() + ")"
                                 + " used=" + next.used() + "/" + next.limit()
                                 + "; quota atomically acquired (1 per request)");
@@ -89,12 +119,19 @@ public class RateLimiter {
         return current;
     }
 
-    /**
-     * 只读视图：返回当前（按传入时钟判定）窗口已用量，不产生扣减。仅供测试与排障。
-     */
+    /** 旧维度只读视图：当前窗口已用量，不产生扣减。 */
     public long currentUsed(String caller, ApiVersion version) {
+        return currentUsed(key(caller, version.httpValue(), null));
+    }
+
+    /** 接口组维度只读视图：当前窗口已用量，不产生扣减。 */
+    public long currentUsed(String caller, ApiVersion version, String groupId) {
+        return currentUsed(key(caller, version.httpValue(), groupId));
+    }
+
+    private long currentUsed(String key) {
         long now = clock.millis();
-        var ref = windows.get(RateLimitConfig.key(caller, version.httpValue()));
+        var ref = windows.get(key);
         if (ref == null) {
             return 0L;
         }
@@ -103,6 +140,12 @@ public class RateLimiter {
             return 0L;
         }
         return w.used();
+    }
+
+    private static String key(String caller, String versionKey, String groupId) {
+        return groupId == null
+                ? RateLimitConfig.key(caller, versionKey)
+                : caller + "|" + versionKey + "|" + groupId;
     }
 
     private record Window(long start, long end, long used, long limit, long windowMillis) {

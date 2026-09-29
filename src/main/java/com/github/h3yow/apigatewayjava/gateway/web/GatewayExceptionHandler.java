@@ -7,7 +7,6 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -25,7 +24,7 @@ public class GatewayExceptionHandler {
     @ExceptionHandler(GatewayException.class)
     public ResponseEntity<ErrorResponse> handleGateway(GatewayException ex, HttpServletRequest request) {
         String traceId = traceId(request);
-        ErrorResponse body = ErrorResponse.of(traceId, ex.reason(), ex.caller(), ex.version(),
+        ErrorResponse body = ErrorResponse.of(traceId, ex.reason(), ex.caller(), ex.version(), ex.groupId(),
                 ex.getMessage(), ex.retryAfterMillis());
         return write(ex.reason(), ex.retryAfterMillis(), traceId, body);
     }
@@ -33,17 +32,20 @@ public class GatewayExceptionHandler {
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex, HttpServletRequest request) {
         String traceId = traceId(request);
-        log.warn("gateway unexpected error traceId={} message={}", traceId, ex.toString());
-        ErrorResponse body = ErrorResponse.of(traceId, RejectReason.DOWNSTREAM_ERROR,
-                null, null, "网关内部错误: " + ex.getClass().getSimpleName(), 0L);
-        return write(RejectReason.DOWNSTREAM_ERROR, 0L, traceId, body);
+        log.warn("gateway unexpected LOCAL error traceId={} message={}", traceId, ex.toString());
+        // 网关自身未预期缺陷属于本地错误，绝不能伪装成下游故障
+        ErrorResponse body = ErrorResponse.of(traceId, RejectReason.GATEWAY_INTERNAL_ERROR,
+                null, null, null, "网关内部错误: " + ex.getClass().getSimpleName(), 0L);
+        return write(RejectReason.GATEWAY_INTERNAL_ERROR, 0L, traceId, body);
     }
 
     private ResponseEntity<ErrorResponse> write(RejectReason reason, long retryAfterMillis,
                                                 String traceId, ErrorResponse body) {
-        ResponseEntity.BodyBuilder builder = ResponseEntity.status(reason.httpStatus())
-                .header(TraceIdFilter.TRACE_ID_HEADER, traceId);
-        if (reason.httpStatus() == HttpStatus.TOO_MANY_REQUESTS.value() && retryAfterMillis > 0) {
+        // X-Trace-Id 由 TraceIdFilter 在同一响应上统一写入（仅一次）；这里不再追加同名响应头，
+        // 保证整个响应只有一个追踪标识，且其值与错误体 body.traceId 严格一致。
+        ResponseEntity.BodyBuilder builder = ResponseEntity.status(reason.httpStatus());
+        // Retry-After 只属于“网关本地限流”的建议；下游 429 不替下游给出重试窗口
+        if (reason == RejectReason.RATE_LIMITED_QUOTA_EXHAUSTED && retryAfterMillis > 0) {
             // 向上取整到秒，符合 Retry-After 的 delta-seconds 形式
             long retryAfterSeconds = (retryAfterMillis + 999L) / 1000L;
             builder.header("Retry-After", String.valueOf(retryAfterSeconds));

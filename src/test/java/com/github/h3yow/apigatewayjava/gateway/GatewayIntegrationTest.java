@@ -194,9 +194,14 @@ class GatewayIntegrationTest {
 
     @Test
     void retriesAreNewRequests_withNewTraceId_andFullReevaluation() throws Exception {
-        // stranger v1.0 配额 1/s：第二次是“重试”，被限流；翻窗后再重试以新请求身份成功
-        ResponseEntity<String> r1 = post("/gateway/mock/downstream/echo", "stranger2", "v1.0");
-        ResponseEntity<String> r2 = post("/gateway/mock/downstream/echo", "stranger2", "v1.0");
+        // stranger 配额 1/s。为避免“两次请求恰好跨秒窗口”造成的时间敏感抖动，
+        // 先对齐到一个新的 1s 固定窗口的起点，再在该窗口内连发两次：
+        long now = System.currentTimeMillis();
+        long sleep = 1_020 - (now % 1_000);
+        Thread.sleep(sleep);
+        String caller = "stranger-retry-" + now;
+        ResponseEntity<String> r1 = post("/gateway/mock/downstream/echo", caller, "v1.0");
+        ResponseEntity<String> r2 = post("/gateway/mock/downstream/echo", caller, "v1.0");
         assertEquals(200, r1.getStatusCode().value());
         assertEquals(429, r2.getStatusCode().value());
         assertNotEquals(r1.getHeaders().getFirst("X-Trace-Id"), r2.getHeaders().getFirst("X-Trace-Id"),
@@ -205,6 +210,127 @@ class GatewayIntegrationTest {
                 + r1.getHeaders().getFirst("X-Trace-Id")
                 + " trace2=" + r2.getHeaders().getFirst("X-Trace-Id"));
         assertFalse(r2.getHeaders().getFirst("X-Trace-Id").isBlank());
+    }
+
+    // ============ 接口组：配额隔离 / 版本与上线状态 / 错误来源 ============
+
+    @Test
+    void apiGroupQuotaIsIsolatedFromOtherGroupsAndCallerQuota() throws Exception {
+        String caller = "grp-iso";
+        String orders = "/gateway/mock/downstream/orders/create";
+
+        // orders 组独立配额 2/s：第 3 次本地限流
+        ResponseEntity<String> o1 = post(orders, caller, "v1.0");
+        ResponseEntity<String> o2 = post(orders, caller, "v1.0");
+        ResponseEntity<String> o3 = post(orders, caller, "v1.0");
+        assertEquals(200, o1.getStatusCode().value());
+        assertEquals(200, o2.getStatusCode().value());
+        assertError(o3, 429, "GATEWAY_RATE_LIMITED");
+        JsonNode limited = MAPPER.readTree(o3.getBody());
+        assertEquals("LOCAL", limited.get("errorSource").asText());
+        assertEquals("orders", limited.get("group").asText());
+        assertTrue(limited.get("retryAfterMillis").asLong() > 0);
+        assertEquals(o3.getHeaders().getFirst("X-Trace-Id"), limited.get("traceId").asText());
+        assertTrue(o3.getHeaders().containsKey("Retry-After"));
+
+        // orders 被打满不影响 default 组（echo 回退到该调用方×版本=默认 1/s）：
+        // 同一调用方同一版本在另一组仍有独立额度
+        ResponseEntity<String> echo = post("/gateway/mock/downstream/echo", caller, "v1.0");
+        assertEquals(200, echo.getStatusCode().value(), "不同接口组额度独立，互不占用");
+
+        // payments 组同样独立（组配额 4/s），前 4 次放行
+        for (int i = 0; i < 4; i++) {
+            assertEquals(200, post("/gateway/mock/downstream/payments/charge", caller, "v1.0").getStatusCode().value(),
+                    "payments 组额度独立于 orders 组");
+        }
+        assertError(post("/gateway/mock/downstream/payments/charge", caller, "v1.0"),
+                429, "GATEWAY_RATE_LIMITED");
+        System.out.println("[IntegrationTest] 接口组配额隔离: orders=2/s 打满不影响 default/payments");
+    }
+
+    @Test
+    void apiGroupRejectionReasonsAreDistinguishable_andNoQuotaConsumed() throws Exception {
+        // PAUSED
+        ResponseEntity<String> paused = post("/gateway/mock/downstream/reports/daily", "grp-rej", "v1.0");
+        assertError(paused, 503, "GATEWAY_API_GROUP_PAUSED");
+        assertSource(paused, "LOCAL", "reports");
+
+        // NOT_OPENED：caller-a 调用方级允许 v1.1，但 ledger-v2 尚未开放 → 组级 404
+        ResponseEntity<String> notOpened = post("/gateway/mock/downstream/ledger/v2", "caller-a", "v1.1");
+        assertError(notOpened, 404, "GATEWAY_API_GROUP_NOT_OPENED");
+        assertSource(notOpened, "LOCAL", "ledger-v2");
+
+        // CANARY：caller-a 在 beta-ai 灰度白名单内 → 放行
+        ResponseEntity<String> canaryOk = post("/gateway/mock/downstream/ai/chat", "caller-a", "v1.1");
+        assertEquals(200, canaryOk.getStatusCode().value(), "灰度白名单内调用方放行");
+
+        // 组版本不开放：orders 只开 v1.0，caller-a 的 v1.1 在调用方级允许，但组级必须拒绝
+        ResponseEntity<String> groupVersion = post("/gateway/mock/downstream/orders/create", "caller-a", "v1.1");
+        assertError(groupVersion, 400, "GATEWAY_API_GROUP_VERSION_NOT_ALLOWED");
+        assertSource(groupVersion, "LOCAL", "orders");
+
+        // 组级版本拒绝不得消耗 orders 组 v1.0 配额（仍可打满 2 个）
+        assertEquals(200, post("/gateway/mock/downstream/orders/create", "grp-rej2", "v1.0").getStatusCode().value());
+        assertEquals(200, post("/gateway/mock/downstream/orders/create", "grp-rej2", "v1.0").getStatusCode().value());
+        System.out.println("[IntegrationTest] PAUSED/NOT_OPENED/组版本拒绝 原因可区分且均为 LOCAL");
+    }
+
+    @Test
+    void unknownRouteAndBadMethodAreLocalErrors_notDownstream() throws Exception {
+        // 未注册路径：本地 404，不转发下游
+        ResponseEntity<String> notFound = post("/gateway/mock/does/not/exist", "grp-route", "v1.0");
+        assertError(notFound, 404, "GATEWAY_ROUTE_NOT_FOUND");
+        assertSource(notFound, "LOCAL", null);
+
+        // GET 一个仅注册了 POST 的路由：本地 405
+        HttpHeaders h = headers("grp-route", "v1.0");
+        ResponseEntity<String> method = rest.exchange(url("/gateway/mock/downstream/orders/create"),
+                HttpMethod.GET, new HttpEntity<>("{}", h), String.class);
+        assertError(method, 405, "GATEWAY_METHOD_NOT_ALLOWED");
+        assertSource(method, "LOCAL", "orders");
+
+        // 这两类本地错误都不应消耗任何配额：grp-route 之后仍可用满 default 组 1/s
+        assertEquals(200, post("/gateway/mock/downstream/echo", "grp-route", "v1.0")
+                .getStatusCode().value(), "本地 404/405 不得扣减配额");
+        System.out.println("[IntegrationTest] 路由不存在=本地404，方法不支持=本地405，均未转发/扣减");
+    }
+
+    @Test
+    void downstreamErrorsAreMarkedDownstream_andNoRetryAfter() throws Exception {
+        ResponseEntity<String> busy = post("/gateway/mock/downstream/busy", "caller-a", "v1.1");
+        assertError(busy, 429, "GATEWAY_DOWNSTREAM_RATE_LIMITED");
+        JsonNode body = MAPPER.readTree(busy.getBody());
+        assertEquals("DOWNSTREAM", body.get("errorSource").asText());
+        assertFalse(busy.getHeaders().containsKey("Retry-After"), "下游 429 不由网关给重试窗口");
+        // 与本地 429 错误码不同
+        assertEquals(200, post("/gateway/mock/downstream/orders/create", "grp-src", "v1.0").getStatusCode().value());
+        assertEquals(200, post("/gateway/mock/downstream/orders/create", "grp-src", "v1.0").getStatusCode().value());
+        ResponseEntity<String> localLimited = post("/gateway/mock/downstream/orders/create", "grp-src", "v1.0");
+        assertError(localLimited, 429, "GATEWAY_RATE_LIMITED");
+        assertEquals("LOCAL", MAPPER.readTree(localLimited.getBody()).get("errorSource").asText());
+        System.out.println("[IntegrationTest] 下游429 errorSource=DOWNSTREAM 与本地429 LOCAL 可区分");
+    }
+
+    @Test
+    void singleTraceId_consistentBetweenHeaderAndBody() throws Exception {
+        ResponseEntity<String> r = post("/gateway/mock/downstream/reports/daily", "grp-trace", "v1.0");
+        String headerTrace = r.getHeaders().getFirst("X-Trace-Id");
+        JsonNode body = MAPPER.readTree(r.getBody());
+        assertFalse(headerTrace == null || headerTrace.isBlank());
+        assertEquals(headerTrace, body.get("traceId").asText(), "响应头与错误体 traceId 必须一致");
+        // 整个响应只保留这一个追踪标识头
+        assertEquals(List.of(headerTrace), r.getHeaders().get("X-Trace-Id"));
+        System.out.println("[IntegrationTest] 唯一 traceId=" + headerTrace + " 头/体一致");
+    }
+
+    private void assertSource(ResponseEntity<String> response, String source, String group)
+            throws Exception {
+        JsonNode body = MAPPER.readTree(response.getBody());
+        assertEquals(source, body.get("errorSource").asText(), "body=" + response.getBody());
+        if (group != null) {
+            assertEquals(group, body.get("group").asText());
+        }
+        assertEquals(response.getHeaders().getFirst("X-Trace-Id"), body.get("traceId").asText());
     }
 
     private void assertError(ResponseEntity<String> response, int httpStatus, String errorCode)

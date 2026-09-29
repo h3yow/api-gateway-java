@@ -44,4 +44,33 @@ public class DownstreamMockController {
         response.setContentType("application/json");
         response.getWriter().write("{\"downstream\":\"busy\"}");
     }
+
+    // —— 业务接口组 mock：orders / payments / reports / beta-ai / ledger-v2 ——
+    // 类级前缀为 /mock/downstream，故这些业务组演示端点也位于此前缀下；
+    // 它们归属于各自的接口组（由 ApiGroupConfig 路由表声明），与 echo 等同路径前缀无关。
+
+    @PostMapping("/orders/create")
+    public String ordersCreate() {
+        return "{\"downstream\":\"orders\",\"created\":true}";
+    }
+
+    @PostMapping("/payments/charge")
+    public String paymentsCharge() {
+        return "{\"downstream\":\"payments\",\"charged\":true}";
+    }
+
+    @PostMapping("/reports/daily")
+    public String reportsDaily() {
+        return "{\"downstream\":\"reports\"}";
+    }
+
+    @PostMapping("/ai/chat")
+    public String aiChat() {
+        return "{\"downstream\":\"beta-ai\",\"reply\":\"ok\"}";
+    }
+
+    @PostMapping("/ledger/v2")
+    public String ledgerV2() {
+        return "{\"downstream\":\"ledger-v2\"}";
+    }
 }
