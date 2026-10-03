@@ -1,5 +1,6 @@
 package com.github.h3yow.apigatewayjava.gateway.ratelimit;
 
+import com.github.h3yow.apigatewayjava.gateway.MutableClock;
 import com.github.h3yow.apigatewayjava.gateway.group.ApiGroupConfig;
 import com.github.h3yow.apigatewayjava.gateway.group.GroupQuotaResolver;
 import com.github.h3yow.apigatewayjava.gateway.model.ApiVersion;
@@ -7,9 +8,6 @@ import com.github.h3yow.apigatewayjava.gateway.model.QuotaPolicy;
 import com.github.h3yow.apigatewayjava.gateway.model.RateLimitDecision;
 import org.junit.jupiter.api.Test;
 
-import java.time.Clock;
-import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -175,33 +173,5 @@ class GroupRateLimiterTest {
         assertEquals(2, rl.currentUsed("caller-a", V10, "orders"));
         System.out.printf("[GroupRateLimitTest] orders 并发守恒 granted=%d rejected=%d%n",
                 granted.get(), rejected.get());
-    }
-
-    /** 可控时钟，毫秒精度（与 RateLimiterTest 中一致的本地可复现手段）。 */
-    static final class MutableClock extends Clock {
-        private volatile long millis;
-
-        MutableClock(long millis) {
-            this.millis = millis;
-        }
-
-        void setMillis(long millis) {
-            this.millis = millis;
-        }
-
-        @Override
-        public java.time.ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(java.time.ZoneId zone) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public Instant instant() {
-            return Instant.ofEpochMilli(millis);
-        }
     }
 }

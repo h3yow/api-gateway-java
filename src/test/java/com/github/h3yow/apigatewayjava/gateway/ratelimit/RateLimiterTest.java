@@ -1,13 +1,11 @@
 package com.github.h3yow.apigatewayjava.gateway.ratelimit;
 
+import com.github.h3yow.apigatewayjava.gateway.MutableClock;
 import com.github.h3yow.apigatewayjava.gateway.model.ApiVersion;
 import com.github.h3yow.apigatewayjava.gateway.model.QuotaPolicy;
 import com.github.h3yow.apigatewayjava.gateway.model.RateLimitDecision;
 import org.junit.jupiter.api.Test;
 
-import java.time.Clock;
-import java.time.Instant;
-import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -172,33 +170,5 @@ class RateLimiterTest {
         assertTrue(d1.acquired());
         assertFalse(d2.acquired(), "未登记调用方必须落到默认 1/s 策略，第二请求即被限流");
         assertTrue(d1.basis().contains("fallback default"));
-    }
-
-    /** 可控时钟，毫秒精度。 */
-    static final class MutableClock extends Clock {
-        private volatile long millis;
-
-        MutableClock(long millis) {
-            this.millis = millis;
-        }
-
-        void setMillis(long millis) {
-            this.millis = millis;
-        }
-
-        @Override
-        public java.time.ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(java.time.ZoneId zone) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public Instant instant() {
-            return Instant.ofEpochMilli(millis);
-        }
     }
 }

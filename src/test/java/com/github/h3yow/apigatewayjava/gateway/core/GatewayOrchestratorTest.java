@@ -1,5 +1,6 @@
 package com.github.h3yow.apigatewayjava.gateway.core;
 
+import com.github.h3yow.apigatewayjava.gateway.MutableClock;
 import com.github.h3yow.apigatewayjava.gateway.downstream.DownstreamClient;
 import com.github.h3yow.apigatewayjava.gateway.downstream.DownstreamException;
 import com.github.h3yow.apigatewayjava.gateway.group.ApiGroupConfig;
@@ -18,10 +19,6 @@ import com.github.h3yow.apigatewayjava.gateway.version.VersionNegotiator;
 import com.github.h3yow.apigatewayjava.gateway.model.VersionPolicy;
 import org.junit.jupiter.api.Test;
 
-import java.time.Clock;
-import java.time.Instant;
-import java.time.ZoneId;
-import java.time.ZoneOffset;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -40,25 +37,6 @@ class GatewayOrchestratorTest {
 
     private static final ApiVersion V10 = new ApiVersion(1, 0);
     private static final ApiVersion V11 = new ApiVersion(1, 1);
-
-    static final class MutableClock extends Clock {
-        private volatile long millis = 10_000;
-
-        @Override
-        public ZoneId getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(ZoneId zone) {
-            throw new UnsupportedOperationException();
-        }
-
-        @Override
-        public Instant instant() {
-            return Instant.ofEpochMilli(millis);
-        }
-    }
 
     /** 可编排结果的假下游，并记录被调用次数。 */
     static final class FakeDownstream extends DownstreamClient {
@@ -96,7 +74,7 @@ class GatewayOrchestratorTest {
         callerQuotas.put(RateLimitConfig.key("caller-a", "v1.0"), new QuotaPolicy(5, 1_000));
         RateLimitConfig callers = new RateLimitConfig(callerQuotas);
         GroupQuotaResolver resolver = new GroupQuotaResolver(groups, callers, Map.of());
-        RateLimiter rl = new RateLimiter(resolver, new MutableClock());
+        RateLimiter rl = new RateLimiter(resolver, new MutableClock(10_000));
         FakeDownstream ds = new FakeDownstream();
         GatewayOrchestrator orch = new GatewayOrchestrator(vn, new RouteRegistry(groups),
                 groups::policyFor, new GroupAuthorizer(), rl, ds);

@@ -210,23 +210,58 @@ curl -i -X POST http://localhost:8080/gateway/mock/downstream/busy \
 mvn test
 ```
 
-共 **40** 个用例。涉及窗口边界与并发的测试**全部注入可控时钟（`MutableClock`）**，
-由测试主动把时间推进到窗口边界（如 `999 → 1000`），**不依赖真实等待**，因此任意时间运行结论一致：
+共 **40** 个用例。所有涉及限流窗口与并发的测试都**不依赖真实时间**：
+
+- 测试共享一个可控时钟 `MutableClock`（`src/test/java/.../gateway/MutableClock.java`），
+  时间只能由测试代码显式推进（`setMillis`/`advanceMillis`），绝不随真实时间流动；
+- 单元/编排测试直接把它传给 `RateLimiter`；端到端测试通过
+  `@TestConfiguration` + `@Primary` 把它替换进 Spring 容器里的 `Clock` Bean，
+  因此**走 HTTP 全链路的集成测试同样由逻辑时钟驱动**；
+- 集成测试每条用例开始前把逻辑时间**向前推进 1 小时**（窗口均为 1s，旧窗口必然过期），
+  用例执行顺序不影响结论；推进量是 1000 的整数倍，窗口起点始终对齐；
+- 窗口边界由测试**主动推进到临界点**（`windowEnd-1ms` 仍拒、恰好 `windowEnd` 放行），
+  并发压测期间时钟冻结，整批请求必然落在同一窗口内——
+  **不存在真实 `Thread.sleep` 等待窗口翻页，也不靠延长等待掩盖竞态**。
+
+因此以下结论在任何时刻、任何机器负载下重复运行都一致：
+
+| 场景 | 保证 | 验证位置 |
+| --- | --- | --- |
+| 并发抢配额 | 总放行数**严格等于**该维度配额，放行序号严格 1..K 无重复 | `RateLimiterTest`（20 线程抢 50）、`GroupRateLimiterTest`（16 线程抢 2）、`GatewayIntegrationTest`（12 线程 HTTP 抢 3） |
+| 拒绝不扣减 | 被拒请求不改动已有计数：打满后再请求仍被拒，且同窗 `retryAfterMillis` 完全一致 | 上述三个测试类均有断言 |
+| 组间额度隔离 | 同调用方同版本在 orders/payments/default 组各自独立计数、互不占用 | `GroupRateLimiterTest`、`GatewayIntegrationTest` |
+| 窗口临界点 | 窗口内打满后再请求必拒；`windowEnd-1ms` 仍拒（`retryAfterMillis=1`）；恰好 `windowEnd` 那一次放行（左闭右开） | `RateLimiterTest`、`GroupRateLimiterTest`、`GatewayIntegrationTest#windowBoundary_*` |
+| 重试语义 | 重试是新请求（新 traceId、重新判定），同窗必拒、翻窗后放行 | `GatewayIntegrationTest#retriesAreNewRequests_*` |
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
 | `GroupRateLimiterTest` | 同调用方同版本跨接口组配额隔离、组配额优先与回退（未配置组不放任）、组窗口切换精确、16 线程抢 2 配额守恒（放行序号 1..2） |
 | `GroupPolicyTest` | PAUSED/NOT_OPENED/CANARY/组版本拒绝原因可区分、组间版本规则独立、不静默替换、404/405 均 LOCAL、非法配置 fail-fast |
 | `GatewayOrchestratorTest` | 假下游 + 可控时钟：本地各类拒绝不扣减/不调下游、放行只扣一次、下游失败不退还且 source=DOWNSTREAM、本地限流先于下游 |
-| `GatewayIntegrationTest` | 端到端：组配额隔离、暂停/未开放/组版本/灰度拒绝、404/405 本地分类、本地与下游 429 区分、唯一 traceId 头/体一致、既有限流/窗口/下游行为 |
+| `GatewayIntegrationTest` | 端到端（逻辑时钟驱动）：并发限流守恒且拒绝不扣减、窗口边界两个临界点、重试新请求、组配额隔离、暂停/未开放/组版本/灰度拒绝、404/405 本地分类、本地与下游 429 区分、唯一 traceId 头/体一致 |
 | `RateLimiterTest` / `VersionNegotiatorTest` / `DownstreamClientTest` | 既有能力回归（调用方×版本限流守恒、调用方版本协商、下游三类错误） |
 
 单测 stdout 打印调用方、版本、接口组、配额与判定依据，例如：
 
 ```
+[IntegrationTest] 并发限流 caller=caller-b version=v1.0 quota=3/s ok=3 limited=21 total=24
+[IntegrationTest] windowEnd-1ms 仍 429 retryAfterMillis=1
+[IntegrationTest] 恰好落在窗口边界 windowEnd 恢复 status=200
 [GroupRateLimitTest] 组间隔离 orders=2 payments=4 default=5 互不占用
 [OrchestratorTest] 本地拒绝均未扣减配额、未调用下游
 ```
+
+### 7.4 稳定性复现步骤
+
+```bash
+# 连续多轮运行，结论必须每轮一致（40 个用例全绿）；-B 关闭颜色便于 grep
+for i in 1 2 3 4 5; do mvn -B test | grep -E "Tests run: [0-9]+, Failures" | tail -1; done
+```
+
+预期：每轮输出均为 `Tests run: 40, Failures: 0, Errors: 0, Skipped: 0`。
+整个套件不涉及外部服务、真实凭据或长时间运行才会触发的条件
+（唯一起真实 HTTP 的是指向同进程 mock 下游与本地 `MockWebServer` 的调用；
+下游超时用例用 1s 延迟对 300ms 超时，量级差距保证结论与执行时刻无关）。
 
 ## 8. 兼容范围
 

@@ -2,11 +2,15 @@ package com.github.h3yow.apigatewayjava.gateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.boot.test.web.client.TestRestTemplate;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Primary;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
@@ -30,10 +34,25 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 全链路集成测试。网关入口 /gateway/** 转发到同进程 mock 下游 /mock/downstream/**。
  * 覆盖：并发限流守恒与错误码区分、窗口恢复、版本不兼容、缺调用方、
  * 下游超时/429/500、错误结构一致且带 traceId、重试为新请求。
+ *
+ * 时间确定性：限流窗口由 {@link MutableClock} 驱动（{@link Primary} 替换系统时钟），
+ * 测试全程不出现真实等待；窗口边界由用例主动推进到临界点，
+ * 任何时刻、任何机器负载下重复运行结论一致。
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = "gateway.downstream.timeout-millis=300")
 class GatewayIntegrationTest {
+
+    /** 用可控时钟替换系统时钟：限流窗口边界完全由测试推进。 */
+    @TestConfiguration
+    static class MutableClockConfig {
+        @Bean
+        @Primary
+        MutableClock mutableClock() {
+            // 初始时刻对齐 1s 窗口边界（可被 1000 整除）
+            return new MutableClock(1_700_000_000_000L);
+        }
+    }
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -42,6 +61,25 @@ class GatewayIntegrationTest {
 
     @Autowired
     TestRestTemplate rest;
+
+    @Autowired
+    MutableClock clock;
+
+    /**
+     * 每条用例开始前把逻辑时间向前推进 1 小时：
+     * 之前用例留下的所有限流窗口（窗口均为 1s）必然过期，
+     * 用例执行顺序不影响结论；推进量为 1000 的整数倍，保持窗口起点对齐。
+     */
+    @BeforeEach
+    void isolateWindows() {
+        clock.advanceMillis(3_600_000L);
+    }
+
+    /** 把逻辑时间推进到下一个 1s 窗口起点（单调前进，绝不回拨）。 */
+    private void alignToNextWindowStart() {
+        long now = clock.millisNow();
+        clock.advanceMillis((1_000 - now % 1_000) % 1_000);
+    }
 
     private String url(String path) {
         return "http://localhost:" + port + path;
@@ -65,6 +103,9 @@ class GatewayIntegrationTest {
 
     @Test
     void concurrentLimit_quotaConservedAndRejectionIsDistinguishable() throws Exception {
+        // 时钟在整个并发压测期间冻结：24 个请求必然落在同一个 1s 窗口内，
+        // 放行数严格等于配额 3，与机器负载、执行时刻无关。
+        alignToNextWindowStart();
         int threads = 12;
         int perThread = 2; // 24 请求；caller-b 配额 3/s
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -120,24 +161,48 @@ class GatewayIntegrationTest {
             assertTrue(r.getHeaders().containsKey("Retry-After"));
         }
         System.out.println("[IntegrationTest] 限流响应样例: " + limitedResponses.get(0).getBody());
+
+        // 被拒绝的请求不得改动已有计数：压测结束后窗口内第 25 个请求仍必须被拒，
+        // 且 retryAfterMillis 与压测期间完全一致（时钟冻结，窗口未变）。
+        ResponseEntity<String> after = post("/gateway/mock/downstream/echo", "caller-b", "v1.0");
+        assertEquals(429, after.getStatusCode().value(), "拒绝不扣减：打满后再请求仍被拒");
+        JsonNode afterBody = MAPPER.readTree(after.getBody());
+        assertEquals(MAPPER.readTree(limitedResponses.get(0).getBody()).get("retryAfterMillis").asLong(),
+                afterBody.get("retryAfterMillis").asLong(),
+                "同一冻结窗口内 retryAfterMillis 必须一致，证明计数未被拒绝请求改动");
+        System.out.println("[IntegrationTest] 压测后再请求仍 429，计数未被拒绝请求改动");
     }
 
     @Test
     void windowBoundary_quotaRecoversInNextSecond() throws Exception {
-        // 未登记调用方配额 1/s：第一次通过，第二次限流；等待窗口翻页后再次通过
+        // 未登记调用方配额 1/s。逻辑时间对齐到窗口起点，整个用例不真实等待：
+        // 临界点由测试主动推进（windowEnd-1 仍拒、恰好 windowEnd 放行）。
+        alignToNextWindowStart();
         ResponseEntity<String> first = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
         ResponseEntity<String> second = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
         System.out.printf("[IntegrationTest] 窗口内 caller=stranger version=v1.0 quota=1/s "
                 + "first=%d second=%d%n", first.getStatusCode().value(), second.getStatusCode().value());
         assertEquals(200, first.getStatusCode().value());
         assertEquals(429, second.getStatusCode().value());
+        JsonNode secondBody = MAPPER.readTree(second.getBody());
+        assertEquals(1_000L, secondBody.get("retryAfterMillis").asLong(),
+                "窗口起点处被拒，retryAfterMillis 必须恰好是整个窗口 1000ms");
 
-        // 等到下一个固定秒窗口
-        long wait = 1_050 - (System.currentTimeMillis() % 1_000);
-        Thread.sleep(Math.max(wait, 50));
+        // 临界点 1：推进到窗口结束前 1ms（windowEnd-1），窗口未翻页，仍必须被拒
+        clock.advanceMillis(999);
+        ResponseEntity<String> stillLimited = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
+        assertEquals(429, stillLimited.getStatusCode().value(), "窗口结束前 1ms 仍须被拒");
+        assertEquals(1L, MAPPER.readTree(stillLimited.getBody()).get("retryAfterMillis").asLong(),
+                "距窗口结束恰好 1ms");
+        System.out.println("[IntegrationTest] windowEnd-1ms 仍 429 retryAfterMillis=1");
+
+        // 临界点 2：再推进 1ms，恰好落在窗口边界 windowEnd —— 新窗口起点，配额恢复
+        clock.advanceMillis(1);
         ResponseEntity<String> recovered = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
-        System.out.println("[IntegrationTest] 翻窗后恢复 status=" + recovered.getStatusCode().value());
-        assertEquals(200, recovered.getStatusCode().value());
+        System.out.println("[IntegrationTest] 恰好落在窗口边界 windowEnd 恢复 status="
+                + recovered.getStatusCode().value());
+        assertEquals(200, recovered.getStatusCode().value(),
+                "恰好跨过窗口边界的那一次必须放行（窗口左闭右开）");
     }
 
     @Test
@@ -194,12 +259,10 @@ class GatewayIntegrationTest {
 
     @Test
     void retriesAreNewRequests_withNewTraceId_andFullReevaluation() throws Exception {
-        // stranger 配额 1/s。为避免“两次请求恰好跨秒窗口”造成的时间敏感抖动，
-        // 先对齐到一个新的 1s 固定窗口的起点，再在该窗口内连发两次：
-        long now = System.currentTimeMillis();
-        long sleep = 1_020 - (now % 1_000);
-        Thread.sleep(sleep);
-        String caller = "stranger-retry-" + now;
+        // stranger 配额 1/s。时钟冻结在同一窗口内，两次请求必然同窗：
+        // 第一次放行、第二次（重试）被限流，无需任何真实等待或对齐。
+        alignToNextWindowStart();
+        String caller = "stranger-retry";
         ResponseEntity<String> r1 = post("/gateway/mock/downstream/echo", caller, "v1.0");
         ResponseEntity<String> r2 = post("/gateway/mock/downstream/echo", caller, "v1.0");
         assertEquals(200, r1.getStatusCode().value());
@@ -210,6 +273,12 @@ class GatewayIntegrationTest {
                 + r1.getHeaders().getFirst("X-Trace-Id")
                 + " trace2=" + r2.getHeaders().getFirst("X-Trace-Id"));
         assertFalse(r2.getHeaders().getFirst("X-Trace-Id").isBlank());
+
+        // 重试想要成功，必须等配额窗口翻页——由测试主动推进窗口验证这一点
+        clock.advanceMillis(1_000);
+        ResponseEntity<String> r3 = post("/gateway/mock/downstream/echo", caller, "v1.0");
+        assertEquals(200, r3.getStatusCode().value(), "窗口翻页后同一调用方的重试重新放行");
+        System.out.println("[IntegrationTest] 翻窗后重试放行 status=" + r3.getStatusCode().value());
     }
 
     // ============ 接口组：配额隔离 / 版本与上线状态 / 错误来源 ============
