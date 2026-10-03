@@ -2,6 +2,8 @@ package com.github.h3yow.apigatewayjava.gateway;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.h3yow.apigatewayjava.gateway.config.AdjustableClock;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -30,6 +32,10 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * 全链路集成测试。网关入口 /gateway/** 转发到同进程 mock 下游 /mock/downstream/**。
  * 覆盖：并发限流守恒与错误码区分、窗口恢复、版本不兼容、缺调用方、
  * 下游超时/429/500、错误结构一致且带 traceId、重试为新请求。
+ *
+ * <p>时间确定性：所有涉及配额/窗口的用例都先把 {@link AdjustableClock} 冻结在
+ * 各自独占的瞬时（间隔 60s，窗口互不重叠），窗口边界由测试主动推进，
+ * 不依赖真实等待，因此任意时刻、任意机器负载下运行结论一致。</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = "gateway.downstream.timeout-millis=300")
@@ -37,11 +43,31 @@ class GatewayIntegrationTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    /** 各用例独占的冻结瞬时：彼此间隔 60s，保证任何维度的 1s 窗口都不重叠。 */
+    private static final long T_CONCURRENT = 1_700_000_000_000L;
+    private static final long T_WINDOW = 1_700_000_060_000L;
+    private static final long T_RETRY = 1_700_000_120_000L;
+    private static final long T_VERSION = 1_700_000_180_000L;
+    private static final long T_DOWNSTREAM_FAIL = 1_700_000_240_000L;
+    private static final long T_GROUP_ISOLATION = 1_700_000_300_000L;
+    private static final long T_GROUP_REJECT = 1_700_000_360_000L;
+    private static final long T_ROUTE = 1_700_000_420_000L;
+    private static final long T_DOWNSTREAM_SOURCE = 1_700_000_480_000L;
+
     @LocalServerPort
     int port;
 
     @Autowired
     TestRestTemplate rest;
+
+    @Autowired
+    AdjustableClock clock;
+
+    /** 每个用例结束后恢复真实时间，避免冻结状态泄漏到共享上下文的其它测试类。 */
+    @AfterEach
+    void releaseClock() {
+        clock.followSystem();
+    }
 
     private String url(String path) {
         return "http://localhost:" + port + path;
@@ -65,6 +91,8 @@ class GatewayIntegrationTest {
 
     @Test
     void concurrentLimit_quotaConservedAndRejectionIsDistinguishable() throws Exception {
+        // 冻结时间：24 个并发请求必然落在同一个 1s 窗口内，与机器负载、真实时刻无关
+        clock.freezeAt(T_CONCURRENT);
         int threads = 12;
         int perThread = 2; // 24 请求；caller-b 配额 3/s
         ExecutorService pool = Executors.newFixedThreadPool(threads);
@@ -124,17 +152,20 @@ class GatewayIntegrationTest {
 
     @Test
     void windowBoundary_quotaRecoversInNextSecond() throws Exception {
-        // 未登记调用方配额 1/s：第一次通过，第二次限流；等待窗口翻页后再次通过
+        // 冻结在窗口 [T_WINDOW, T_WINDOW+1000) 的最后一毫秒：边界位置由测试精确指定
+        clock.freezeAt(T_WINDOW + 999);
+        // 未登记调用方配额 1/s：第一次通过，第二次限流且 retryAfter 恰好指向窗口末
         ResponseEntity<String> first = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
         ResponseEntity<String> second = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
         System.out.printf("[IntegrationTest] 窗口内 caller=stranger version=v1.0 quota=1/s "
                 + "first=%d second=%d%n", first.getStatusCode().value(), second.getStatusCode().value());
         assertEquals(200, first.getStatusCode().value());
         assertEquals(429, second.getStatusCode().value());
+        JsonNode limited = MAPPER.readTree(second.getBody());
+        assertEquals(1L, limited.get("retryAfterMillis").asLong(), "距窗口结束恰好 1ms");
 
-        // 等到下一个固定秒窗口
-        long wait = 1_050 - (System.currentTimeMillis() % 1_000);
-        Thread.sleep(Math.max(wait, 50));
+        // 主动把时钟推进 1ms 跨过窗口边界（不真实等待）：计数归零、配额恢复
+        clock.advanceMillis(1);
         ResponseEntity<String> recovered = post("/gateway/mock/downstream/echo", "stranger", "v1.0");
         System.out.println("[IntegrationTest] 翻窗后恢复 status=" + recovered.getStatusCode().value());
         assertEquals(200, recovered.getStatusCode().value());
@@ -142,6 +173,7 @@ class GatewayIntegrationTest {
 
     @Test
     void versionNegotiationRejectionsAreExplicit_neverSilentlyFallback() throws Exception {
+        clock.freezeAt(T_VERSION);
         // 缺版本
         ResponseEntity<String> missing = post("/gateway/mock/downstream/echo", "caller-a", null);
         // caller-b 不被允许的 v1.1
@@ -173,6 +205,7 @@ class GatewayIntegrationTest {
 
     @Test
     void downstreamFailuresMapToDistinctErrors_unifiedShape() throws Exception {
+        clock.freezeAt(T_DOWNSTREAM_FAIL);
         // caller-a v1.1 配额 10/s，避免限流干扰
         ResponseEntity<String> timeout = post("/gateway/mock/downstream/slow", "caller-a", "v1.1");
         ResponseEntity<String> busy = post("/gateway/mock/downstream/busy", "caller-a", "v1.1");
@@ -194,12 +227,9 @@ class GatewayIntegrationTest {
 
     @Test
     void retriesAreNewRequests_withNewTraceId_andFullReevaluation() throws Exception {
-        // stranger 配额 1/s。为避免“两次请求恰好跨秒窗口”造成的时间敏感抖动，
-        // 先对齐到一个新的 1s 固定窗口的起点，再在该窗口内连发两次：
-        long now = System.currentTimeMillis();
-        long sleep = 1_020 - (now % 1_000);
-        Thread.sleep(sleep);
-        String caller = "stranger-retry-" + now;
+        // 冻结时间：两次请求必然落在同一窗口，不需要先对齐窗口起点、不真实等待
+        clock.freezeAt(T_RETRY);
+        String caller = "stranger-retry";
         ResponseEntity<String> r1 = post("/gateway/mock/downstream/echo", caller, "v1.0");
         ResponseEntity<String> r2 = post("/gateway/mock/downstream/echo", caller, "v1.0");
         assertEquals(200, r1.getStatusCode().value());
@@ -216,6 +246,7 @@ class GatewayIntegrationTest {
 
     @Test
     void apiGroupQuotaIsIsolatedFromOtherGroupsAndCallerQuota() throws Exception {
+        clock.freezeAt(T_GROUP_ISOLATION);
         String caller = "grp-iso";
         String orders = "/gateway/mock/downstream/orders/create";
 
@@ -250,6 +281,7 @@ class GatewayIntegrationTest {
 
     @Test
     void apiGroupRejectionReasonsAreDistinguishable_andNoQuotaConsumed() throws Exception {
+        clock.freezeAt(T_GROUP_REJECT);
         // PAUSED
         ResponseEntity<String> paused = post("/gateway/mock/downstream/reports/daily", "grp-rej", "v1.0");
         assertError(paused, 503, "GATEWAY_API_GROUP_PAUSED");
@@ -277,6 +309,7 @@ class GatewayIntegrationTest {
 
     @Test
     void unknownRouteAndBadMethodAreLocalErrors_notDownstream() throws Exception {
+        clock.freezeAt(T_ROUTE);
         // 未注册路径：本地 404，不转发下游
         ResponseEntity<String> notFound = post("/gateway/mock/does/not/exist", "grp-route", "v1.0");
         assertError(notFound, 404, "GATEWAY_ROUTE_NOT_FOUND");
@@ -297,6 +330,7 @@ class GatewayIntegrationTest {
 
     @Test
     void downstreamErrorsAreMarkedDownstream_andNoRetryAfter() throws Exception {
+        clock.freezeAt(T_DOWNSTREAM_SOURCE);
         ResponseEntity<String> busy = post("/gateway/mock/downstream/busy", "caller-a", "v1.1");
         assertError(busy, 429, "GATEWAY_DOWNSTREAM_RATE_LIMITED");
         JsonNode body = MAPPER.readTree(busy.getBody());

@@ -32,9 +32,13 @@ import java.util.Map;
 @Configuration
 public class GatewayConfig {
 
+    /**
+     * 网关统一时钟。默认跟随系统时间（与 {@code Clock.systemUTC()} 行为一致）；
+     * 测试可注入同一 Bean 冻结/推进时间，确定性验证窗口边界与并发配额。
+     */
     @Bean
-    public Clock systemClock() {
-        return Clock.systemUTC();
+    public AdjustableClock systemClock() {
+        return new AdjustableClock();
     }
 
     @Bean

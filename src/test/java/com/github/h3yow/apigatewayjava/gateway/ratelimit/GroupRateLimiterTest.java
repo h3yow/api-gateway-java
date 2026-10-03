@@ -177,6 +177,66 @@ class GroupRateLimiterTest {
                 granted.get(), rejected.get());
     }
 
+    @Test
+    void concurrentGroupAcquire_repeatableAcrossManyRoundsInOneJvm() throws Exception {
+        // 同一进程内连续 25 轮：每轮 64 并发抢 orders 组 2 个配额，
+        // 同时验证同调用方同版本在 payments 组的额度始终不被占用。
+        int rounds = 25;
+        for (int round = 1; round <= rounds; round++) {
+            MutableClock clock = new MutableClock(5_000);
+            ApiGroupConfig groups = ApiGroupConfig.defaultLocalConfig(
+                    java.util.List.of(V10, new ApiVersion(1, 1)));
+            RateLimiter rl = limiter(groups, callerConfig(), clock);
+
+            int threads = 16;
+            int perThread = 4;
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threads);
+            AtomicInteger granted = new AtomicInteger();
+            AtomicInteger rejected = new AtomicInteger();
+            ConcurrentLinkedQueue<Long> usages = new ConcurrentLinkedQueue<>();
+
+            for (int t = 0; t < threads; t++) {
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        for (int i = 0; i < perThread; i++) {
+                            RateLimitDecision d = rl.tryAcquire("caller-a", V10, "orders");
+                            if (d.acquired()) {
+                                granted.incrementAndGet();
+                                usages.add(d.used());
+                            } else {
+                                rejected.incrementAndGet();
+                                assertEquals(2, d.used(), "被拒绝时 used 必须停在 2");
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            start.countDown();
+            assertTrue(done.await(30, TimeUnit.SECONDS));
+            pool.shutdown();
+
+            assertEquals(2, granted.get(), "第 " + round + " 轮 orders 组恰好放行 2");
+            assertEquals(threads * perThread - 2, rejected.get());
+            assertEquals(java.util.List.of(1L, 2L), usages.stream().sorted().toList(),
+                    "第 " + round + " 轮放行序号严格 1..2");
+            assertEquals(2, rl.currentUsed("caller-a", V10, "orders"));
+            // 跨组隔离：orders 被打满，payments 组额度仍是满的 4
+            for (int i = 0; i < 4; i++) {
+                assertTrue(rl.tryAcquire("caller-a", V10, "payments").acquired(),
+                        "第 " + round + " 轮 payments 组额度不受 orders 影响");
+            }
+            assertFalse(rl.tryAcquire("caller-a", V10, "payments").acquired());
+        }
+        System.out.printf("[GroupRateLimitTest] 单进程连续 %d 轮组维度并发守恒+跨组隔离结论一致%n", rounds);
+    }
+
     /** 可控时钟，毫秒精度（与 RateLimiterTest 中一致的本地可复现手段）。 */
     static final class MutableClock extends Clock {
         private volatile long millis;

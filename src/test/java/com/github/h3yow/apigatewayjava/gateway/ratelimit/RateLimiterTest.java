@@ -174,6 +174,89 @@ class RateLimiterTest {
         assertTrue(d1.basis().contains("fallback default"));
     }
 
+    @Test
+    void concurrentQuotaConservation_repeatableAcrossManyRoundsInOneJvm() throws Exception {
+        // 同一进程内连续 25 轮：每轮全新限流器 + 冻结时钟，200 并发抢 50 配额，
+        // 每轮结论必须严格一致（放行=50、拒绝=150、序号 1..50），证明结果不随运行时刻漂移。
+        int rounds = 25;
+        for (int round = 1; round <= rounds; round++) {
+            RateLimitConfig cfg = config(Map.of(
+                    RateLimitConfig.key("caller-a", "v1.0"), new QuotaPolicy(50, 1_000)));
+            RateLimiter limiter = new RateLimiter(cfg, new MutableClock(1_000));
+
+            int threads = 20;
+            int perThread = 10;
+            ExecutorService pool = Executors.newFixedThreadPool(threads);
+            CountDownLatch start = new CountDownLatch(1);
+            CountDownLatch done = new CountDownLatch(threads);
+            AtomicInteger granted = new AtomicInteger();
+            AtomicInteger rejected = new AtomicInteger();
+            ConcurrentLinkedQueue<Long> usages = new ConcurrentLinkedQueue<>();
+
+            for (int t = 0; t < threads; t++) {
+                pool.submit(() -> {
+                    try {
+                        start.await();
+                        for (int i = 0; i < perThread; i++) {
+                            RateLimitDecision d = limiter.tryAcquire("caller-a", V10);
+                            if (d.acquired()) {
+                                granted.incrementAndGet();
+                                usages.add(d.used());
+                            } else {
+                                rejected.incrementAndGet();
+                                assertEquals(50, d.used(), "被拒绝时 used 必须停在 50");
+                            }
+                        }
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    } finally {
+                        done.countDown();
+                    }
+                });
+            }
+            start.countDown();
+            assertTrue(done.await(30, TimeUnit.SECONDS));
+            pool.shutdown();
+
+            assertEquals(50, granted.get(), "第 " + round + " 轮放行数必须等于配额");
+            assertEquals(150, rejected.get(), "第 " + round + " 轮拒绝数=总请求-配额");
+            assertEquals(50, limiter.currentUsed("caller-a", V10));
+            List<Long> sorted = usages.stream().sorted().toList();
+            for (int i = 0; i < 50; i++) {
+                assertEquals(i + 1L, sorted.get(i), "第 " + round + " 轮放行序号必须严格 1..50");
+            }
+        }
+        System.out.printf("[RateLimitTest] 单进程连续 %d 轮并发守恒结论一致 granted=50 rejected=150%n", rounds);
+    }
+
+    @Test
+    void windowBoundary_repeatableAcrossManyRoundsInOneJvm() {
+        // 同一进程内连续 25 轮窗口临界：打满即拒、retryAfter 精确、跨边界那一毫秒恢复，
+        // 每轮结论逐字节一致，不依赖真实时间流逝。
+        int rounds = 25;
+        for (int round = 1; round <= rounds; round++) {
+            RateLimitConfig cfg = config(Map.of(
+                    RateLimitConfig.key("caller-a", "v1.0"), new QuotaPolicy(3, 1_000)));
+            MutableClock clock = new MutableClock(999);
+            RateLimiter limiter = new RateLimiter(cfg, clock);
+
+            assertTrue(limiter.tryAcquire("caller-a", V10).acquired());
+            assertTrue(limiter.tryAcquire("caller-a", V10).acquired());
+            assertTrue(limiter.tryAcquire("caller-a", V10).acquired());
+            RateLimitDecision reject = limiter.tryAcquire("caller-a", V10);
+            assertFalse(reject.acquired(), "第 " + round + " 轮窗口内第 4 次必须被拒");
+            assertEquals(1L, reject.retryAfterMillis());
+            assertEquals(3, limiter.currentUsed("caller-a", V10), "第 " + round + " 轮拒绝不得改计数");
+
+            clock.setMillis(1_000);
+            RateLimitDecision next = limiter.tryAcquire("caller-a", V10);
+            assertTrue(next.acquired(), "第 " + round + " 轮跨过边界那一次必须放行");
+            assertEquals(1L, next.used());
+            assertEquals(1_000L, next.windowStart());
+        }
+        System.out.printf("[RateLimitTest] 单进程连续 %d 轮窗口临界结论一致 999ms拒/1000ms放行%n", rounds);
+    }
+
     /** 可控时钟，毫秒精度。 */
     static final class MutableClock extends Clock {
         private volatile long millis;

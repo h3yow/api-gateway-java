@@ -94,6 +94,8 @@ caller-b `*`=3/s；未登记调用方=1/s。
 - **只扣一次**：仅在版本协商、路由、组准入全部通过后、调用下游之前扣减一次；
   编排层对 `tryAcquire` 只调用一次，无重试逻辑。下游超时/429/500 **不退还**配额。
 - 限流返回 `429 GATEWAY_RATE_LIMITED`，含 `retryAfterMillis` 与 `Retry-After`（向上取整秒）。
+- **时钟可注入**：`RateLimiter` 只通过 `Clock` Bean 取时。生产装配的 `AdjustableClock`
+  默认跟随系统时间；测试可冻结/推进它，使窗口边界与并发结论在任何时刻运行都一致（见 §7.3）。
 
 ## 5. 版本协商与接口组开放语义
 
@@ -207,25 +209,57 @@ curl -i -X POST http://localhost:8080/gateway/mock/downstream/busy \
 ### 7.3 自动化测试（任意时间稳定复现）
 
 ```bash
-mvn test
+mvn test          # 全量 43 个用例
+mvn test          # 再跑一遍：结论逐条一致（已实测连续多轮 43/43 通过）
 ```
 
-共 **40** 个用例。涉及窗口边界与并发的测试**全部注入可控时钟（`MutableClock`）**，
-由测试主动把时间推进到窗口边界（如 `999 → 1000`），**不依赖真实等待**，因此任意时间运行结论一致：
+#### 时间确定性：不靠真实等待，边界由测试主动推进
+
+所有涉及配额窗口与并发的用例都**不读真实时间、不做 `Thread.sleep`**：
+
+- 主代码提供 `AdjustableClock`（`gateway/config`），作为 `Clock` Bean 注入 `RateLimiter`。
+  **默认跟随系统时间，生产行为与 `Clock.systemUTC()` 完全一致**；测试注入同一个 Bean 后可
+  `freezeAt(millis)` 冻结、`advanceMillis(delta)` 主动推进、`followSystem()` 恢复。
+- 集成测试（`GatewayIntegrationTest`，真实 HTTP 全链路）每个用例把时钟冻结在**各自独占的瞬时**
+  （间隔 60s，任何维度的 1s 窗口互不重叠），因此：
+  - 并发压测的 24 个请求必然落在同一窗口——无论机器负载多高、请求在真实时间上拉得多长，
+    放行数恒等于配额 3，不会“跨整秒多放行”；
+  - 窗口临界用例冻结在窗口最后一毫秒（`retryAfterMillis` 恒为 1），再用
+    `advanceMillis(1)` 主动跨过边界验证恢复，而不是真实等待下一秒；
+  - “重试是新请求”用例不再先对齐窗口起点再真实等待，直接冻结后连发两请求。
+- 单元测试（`RateLimiterTest` / `GroupRateLimiterTest` / `GatewayOrchestratorTest`）
+  使用各自的 `MutableClock`，同样由测试主动把边界推进到临界点（如 `999 → 1000`）。
+- 每个集成用例结束后 `followSystem()` 复位，冻结状态不会泄漏到共享 Spring 上下文的其它测试类。
+
+#### 单进程内可重复复现
+
+以下用例在**一次 JVM 进程内连续跑 25 轮**，每轮全新限流器实例、结论逐轮断言一致，
+证明结果不随运行时刻、调度顺序漂移：
+
+| 用例 | 每轮断言 |
+| --- | --- |
+| `RateLimiterTest.concurrentQuotaConservation_repeatableAcrossManyRoundsInOneJvm` | 200 并发抢 50 配额：放行恒=50、拒绝恒=150、放行序号严格 1..50、被拒时 used 恒停在 50 |
+| `RateLimiterTest.windowBoundary_repeatableAcrossManyRoundsInOneJvm` | 窗口内打满后第 4 次必拒（retryAfter=1ms）、拒绝不改计数、推进 1ms 跨边界那一次必放行且 used=1 |
+| `GroupRateLimiterTest.concurrentGroupAcquire_repeatableAcrossManyRoundsInOneJvm` | 64 并发抢 orders 组 2 配额：放行恒=2、序号 1..2；同调用方同版本 payments 组 4 额度始终不受影响 |
+
+#### 覆盖矩阵（共 43 个用例）
 
 | 测试类 | 覆盖内容 |
 | --- | --- |
-| `GroupRateLimiterTest` | 同调用方同版本跨接口组配额隔离、组配额优先与回退（未配置组不放任）、组窗口切换精确、16 线程抢 2 配额守恒（放行序号 1..2） |
+| `GroupRateLimiterTest` | 同调用方同版本跨接口组配额隔离、组配额优先与回退（未配置组不放任）、组窗口切换精确、16 线程抢 2 配额守恒（放行序号 1..2）、单进程 25 轮组维度并发守恒+跨组隔离 |
 | `GroupPolicyTest` | PAUSED/NOT_OPENED/CANARY/组版本拒绝原因可区分、组间版本规则独立、不静默替换、404/405 均 LOCAL、非法配置 fail-fast |
 | `GatewayOrchestratorTest` | 假下游 + 可控时钟：本地各类拒绝不扣减/不调下游、放行只扣一次、下游失败不退还且 source=DOWNSTREAM、本地限流先于下游 |
-| `GatewayIntegrationTest` | 端到端：组配额隔离、暂停/未开放/组版本/灰度拒绝、404/405 本地分类、本地与下游 429 区分、唯一 traceId 头/体一致、既有限流/窗口/下游行为 |
-| `RateLimiterTest` / `VersionNegotiatorTest` / `DownstreamClientTest` | 既有能力回归（调用方×版本限流守恒、调用方版本协商、下游三类错误） |
+| `GatewayIntegrationTest` | 端到端（冻结时钟）：并发 24 抢 3 配额守恒、窗口末毫秒拒绝+推进 1ms 恢复、组配额隔离、暂停/未开放/组版本/灰度拒绝、404/405 本地分类、本地与下游 429 区分、唯一 traceId 头/体一致、重试即新请求 |
+| `RateLimiterTest` / `VersionNegotiatorTest` / `DownstreamClientTest` | 既有能力回归（调用方×版本限流守恒、窗口临界、调用方版本协商、下游三类错误）+ 单进程 25 轮并发守恒与窗口临界 |
 
 单测 stdout 打印调用方、版本、接口组、配额与判定依据，例如：
 
 ```
-[GroupRateLimitTest] 组间隔离 orders=2 payments=4 default=5 互不占用
-[OrchestratorTest] 本地拒绝均未扣减配额、未调用下游
+[RateLimitTest] 单进程连续 25 轮并发守恒结论一致 granted=50 rejected=150
+[GroupRateLimitTest] 单进程连续 25 轮组维度并发守恒+跨组隔离结论一致
+[IntegrationTest] 并发限流 caller=caller-b version=v1.0 quota=3/s ok=3 limited=21 total=24
+[IntegrationTest] 窗口内 caller=stranger version=v1.0 quota=1/s first=200 second=429
+[IntegrationTest] 翻窗后恢复 status=200
 ```
 
 ## 8. 兼容范围
